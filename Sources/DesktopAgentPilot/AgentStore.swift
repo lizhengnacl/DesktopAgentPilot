@@ -3,7 +3,7 @@ import Foundation
 struct CLIConfig {
     var cliType: String = "codex"
     var cliCommand: String = "codex"
-    var workDir: String = FileManager.default.currentDirectoryPath
+    var workDir: String = FileManager.default.homeDirectoryForCurrentUser.path
     var confirmMode: String = "key"
     var cliArgs: [String] = [
         "--dangerously-bypass-approvals-and-sandbox",
@@ -192,13 +192,82 @@ struct WorkDirHistoryRecord {
     }
 }
 
+enum WorkDirPersistence {
+    private static let recentWorkDirsKey = "DesktopAgentPilot.recentWorkDirs"
+    private static let lastWorkDirKey = "DesktopAgentPilot.lastWorkDir"
+    private static let maxRecentWorkDirs = 30
+
+    static func loadWorkDirs() -> [String: WorkDirHistoryRecord] {
+        guard let rawItems = UserDefaults.standard.array(forKey: recentWorkDirsKey) as? [[String: Any]] else {
+            return [:]
+        }
+
+        var records: [String: WorkDirHistoryRecord] = [:]
+        for item in rawItems {
+            guard let rawPath = item["path"] as? String else { continue }
+            let path = WorkspacePaths.resolveAbsolute(rawPath)
+            guard directoryExists(path) else { continue }
+
+            let name = (item["name"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? URL(fileURLWithPath: path).lastPathComponent
+            let lastUsedAt = readInt64(item["lastUsedAt"]) ?? millisecondsSince1970()
+            let createdAt = readInt64(item["createdAt"]) ?? lastUsedAt
+
+            records[path] = WorkDirHistoryRecord(
+                path: path,
+                name: name,
+                lastUsedAt: lastUsedAt,
+                createdAt: createdAt
+            )
+        }
+        return records
+    }
+
+    static func loadLastWorkDir() -> String? {
+        guard let rawPath = UserDefaults.standard.string(forKey: lastWorkDirKey) else { return nil }
+        let path = WorkspacePaths.resolveAbsolute(rawPath)
+        return directoryExists(path) ? path : nil
+    }
+
+    static func save(workDirs: [String: WorkDirHistoryRecord], lastWorkDir: String?) {
+        let items = workDirs.values
+            .filter { directoryExists($0.path) }
+            .sorted { $0.lastUsedAt > $1.lastUsedAt }
+            .prefix(maxRecentWorkDirs)
+            .map { $0.client() }
+        UserDefaults.standard.set(Array(items), forKey: recentWorkDirsKey)
+
+        if let lastWorkDir, directoryExists(lastWorkDir) {
+            UserDefaults.standard.set(lastWorkDir, forKey: lastWorkDirKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: lastWorkDirKey)
+        }
+    }
+
+    private static func directoryExists(_ path: String) -> Bool {
+        var isDir = ObjCBool(false)
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+    }
+
+    private static func readInt64(_ value: Any?) -> Int64? {
+        if let value = value as? Int64 { return value }
+        if let value = value as? Int { return Int64(value) }
+        if let value = value as? NSNumber { return value.int64Value }
+        if let value = value as? String { return Int64(value) }
+        return nil
+    }
+}
+
 final class AgentStore: @unchecked Sendable {
     private let lock = NSRecursiveLock()
     private(set) var currentSession: SessionRecord
     private var historyTasks: [HistoryTaskRecord] = []
-    private var workDirs: [String: WorkDirHistoryRecord] = [:]
+    private var workDirs: [String: WorkDirHistoryRecord]
+    private var lastWorkDir: String?
 
     init(config: CLIConfig) {
+        self.workDirs = WorkDirPersistence.loadWorkDirs()
+        self.lastWorkDir = WorkDirPersistence.loadLastWorkDir()
         self.currentSession = SessionRecord(
             id: makeUUID(),
             status: "idle",
@@ -462,14 +531,50 @@ final class AgentStore: @unchecked Sendable {
         }
     }
 
+    func includeWorkDir(_ rawPath: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        _ = upsertWorkDir(rawPath, updateTimestamp: false)
+        persistWorkDirs()
+    }
+
     func recordWorkDir(_ rawPath: String) {
         lock.lock()
         defer { lock.unlock() }
+        guard let path = upsertWorkDir(rawPath, updateTimestamp: true) else { return }
+        lastWorkDir = path
+        persistWorkDirs()
+    }
+
+    func recentWorkDirs(current: String) -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        _ = upsertWorkDir(current, updateTimestamp: false)
+        persistWorkDirs()
+        return workDirs.values
+            .filter { AgentStore.directoryExists($0.path) }
+            .sorted { $0.lastUsedAt > $1.lastUsedAt }
+            .map { $0.client() }
+    }
+
+    func lastRecordedWorkDir() -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let lastWorkDir,
+              let record = workDirs[lastWorkDir],
+              AgentStore.directoryExists(record.path) else { return nil }
+        return record.client()
+    }
+
+    private func upsertWorkDir(_ rawPath: String, updateTimestamp: Bool) -> String? {
         let path = WorkspacePaths.resolveAbsolute(rawPath)
-        guard FileManager.default.fileExists(atPath: path, isDirectory: nil) else { return }
+        var isDir = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return nil }
         let now = millisecondsSince1970()
         if var existing = workDirs[path] {
-            existing.lastUsedAt = now
+            if updateTimestamp {
+                existing.lastUsedAt = now
+            }
             workDirs[path] = existing
         } else {
             workDirs[path] = WorkDirHistoryRecord(
@@ -479,16 +584,16 @@ final class AgentStore: @unchecked Sendable {
                 createdAt: now
             )
         }
+        return path
     }
 
-    func recentWorkDirs(current: String) -> [[String: Any]] {
-        recordWorkDir(current)
-        lock.lock()
-        defer { lock.unlock() }
-        return workDirs.values
-            .filter { FileManager.default.fileExists(atPath: $0.path, isDirectory: nil) }
-            .sorted { $0.lastUsedAt > $1.lastUsedAt }
-            .map { $0.client() }
+    private func persistWorkDirs() {
+        WorkDirPersistence.save(workDirs: workDirs, lastWorkDir: lastWorkDir)
+    }
+
+    private static func directoryExists(_ path: String) -> Bool {
+        var isDir = ObjCBool(false)
+        return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
     }
 
     func messageBeforeBranch(id: String) -> (source: SessionRecord, target: SessionMessage)? {

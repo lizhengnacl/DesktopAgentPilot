@@ -29,6 +29,7 @@ final class RoundedGroupView: NSView {
 final class DesktopAgentPilotApp: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private let server = AgentPilotServer()
+    private let portOccupancyManager = PortOccupancyManager()
     private let powerManager = PowerAssertionManager()
     private let statusDot = NSView()
     private let stateSymbolView = NSImageView()
@@ -41,8 +42,10 @@ final class DesktopAgentPilotApp: NSObject, NSApplicationDelegate {
     private let qrCodeImageView = NSImageView()
     private let startButton = NSButton(title: "启动服务", target: nil, action: nil)
     private let stopButton = NSButton(title: "关闭服务", target: nil, action: nil)
+    private let closePortButton = NSButton(title: "关闭占用端口", target: nil, action: nil)
     private var startMenuItem: NSMenuItem?
     private var stopMenuItem: NSMenuItem?
+    private var closePortMenuItem: NSMenuItem?
 
     static func main() {
         let app = NSApplication.shared
@@ -100,13 +103,18 @@ final class DesktopAgentPilotApp: NSObject, NSApplicationDelegate {
         let serviceMenuItem = NSMenuItem(title: "服务", action: nil, keyEquivalent: "")
         let startMenuItem = NSMenuItem(title: "启动服务", action: #selector(startServerFromControl(_:)), keyEquivalent: "r")
         let stopMenuItem = NSMenuItem(title: "关闭服务", action: #selector(stopServerFromControl(_:)), keyEquivalent: ".")
+        let closePortMenuItem = NSMenuItem(title: "关闭占用端口", action: #selector(closeOccupiedPortFromControl(_:)), keyEquivalent: "k")
         startMenuItem.target = self
         stopMenuItem.target = self
+        closePortMenuItem.target = self
         serviceMenu.addItem(startMenuItem)
         serviceMenu.addItem(stopMenuItem)
+        serviceMenu.addItem(NSMenuItem.separator())
+        serviceMenu.addItem(closePortMenuItem)
         serviceMenuItem.submenu = serviceMenu
         self.startMenuItem = startMenuItem
         self.stopMenuItem = stopMenuItem
+        self.closePortMenuItem = closePortMenuItem
 
         let mainMenu = NSMenu()
         appMenuItem.submenu = appMenu
@@ -251,7 +259,15 @@ final class DesktopAgentPilotApp: NSObject, NSApplicationDelegate {
         stopButton.imagePosition = .imageLeading
         stopButton.toolTip = "关闭本机服务"
 
-        let buttonStack = NSStackView(views: [startButton, stopButton])
+        closePortButton.target = self
+        closePortButton.action = #selector(closeOccupiedPortFromControl(_:))
+        closePortButton.bezelStyle = .rounded
+        closePortButton.controlSize = .large
+        closePortButton.image = NSImage(systemSymbolName: "xmark.circle.fill", accessibilityDescription: "关闭占用端口")
+        closePortButton.imagePosition = .imageLeading
+        closePortButton.toolTip = "关闭正在占用监听端口的进程并重试启动"
+
+        let buttonStack = NSStackView(views: [startButton, stopButton, closePortButton])
         buttonStack.orientation = .horizontal
         buttonStack.alignment = .centerY
         buttonStack.spacing = 12
@@ -350,10 +366,15 @@ final class DesktopAgentPilotApp: NSObject, NSApplicationDelegate {
 
         let canStart = update.state == .stopped || update.state == .failed
         let canStop = update.state == .starting || update.state == .running
+        let canCloseOccupiedPort = update.state == .failed
         startButton.isEnabled = canStart
         stopButton.isEnabled = canStop
+        closePortButton.isEnabled = canCloseOccupiedPort
+        closePortButton.isHidden = !canCloseOccupiedPort
         startMenuItem?.isEnabled = canStart
         stopMenuItem?.isEnabled = canStop
+        closePortMenuItem?.isEnabled = canCloseOccupiedPort
+        closePortMenuItem?.isHidden = !canCloseOccupiedPort
         updatePowerAssertion(for: update.state)
     }
 
@@ -492,5 +513,72 @@ final class DesktopAgentPilotApp: NSObject, NSApplicationDelegate {
 
     @objc private func stopServerFromControl(_ sender: Any?) {
         stopServer()
+    }
+
+    @objc private func closeOccupiedPortFromControl(_ sender: Any?) {
+        closeOccupiedPortAndRestart()
+    }
+
+    private func closeOccupiedPortAndRestart() {
+        let port = server.listenPort
+        let processes: [PortOccupant]
+
+        do {
+            processes = try portOccupancyManager.listeningProcesses(on: port)
+        } catch {
+            updateServiceStatus(AgentPilotServiceUpdate(state: .failed, message: "查询端口 \(port) 占用失败: \(error.localizedDescription)"))
+            showAlert(title: "无法查询端口占用", detail: error.localizedDescription, style: .warning)
+            return
+        }
+
+        guard !processes.isEmpty else {
+            updateServiceStatus(AgentPilotServiceUpdate(state: .failed, message: "未找到正在监听端口 \(port) 的进程，请重试启动或临时换端口。"))
+            return
+        }
+
+        guard confirmTerminate(processes: processes, port: port) else {
+            return
+        }
+
+        updateServiceStatus(AgentPilotServiceUpdate(state: .starting, message: "正在关闭占用端口 \(port) 的进程..."))
+
+        do {
+            try portOccupancyManager.terminate(processes)
+        } catch {
+            updateServiceStatus(AgentPilotServiceUpdate(state: .failed, message: "关闭端口 \(port) 占用进程失败: \(error.localizedDescription)"))
+            showAlert(title: "关闭占用端口失败", detail: error.localizedDescription, style: .critical)
+            return
+        }
+
+        updateServiceStatus(AgentPilotServiceUpdate(state: .starting, message: "已关闭占用端口 \(port) 的进程，正在重试启动..."))
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            self?.startServer()
+        }
+    }
+
+    private func confirmTerminate(processes: [PortOccupant], port: UInt16) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "关闭占用端口 \(port) 的服务？"
+        alert.informativeText = "将向以下进程发送终止信号，然后重试启动 DesktopAgentPilot:\n\n\(format(processes: processes))"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "关闭并重试")
+        alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func showAlert(title: String, detail: String, style: NSAlert.Style) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.alertStyle = style
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    private func format(processes: [PortOccupant]) -> String {
+        processes
+            .map { "\($0.command) (PID \($0.pid))" }
+            .joined(separator: "\n")
     }
 }

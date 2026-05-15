@@ -51,7 +51,7 @@ final class AgentPilotServer: @unchecked Sendable {
         cli.setEventHandler { [weak self] event in
             self?.broadcast(event)
         }
-        store.recordWorkDir(initialConfig.workDir)
+        store.includeWorkDir(initialConfig.workDir)
     }
 
     func start() throws {
@@ -193,10 +193,14 @@ final class AgentPilotServer: @unchecked Sendable {
 
             case ("GET", "/api/workdirs"):
                 let current = currentWorkDir()
-                return json(200, [
+                var payload: [String: Any] = [
                     "current": current,
                     "workdirs": store.recentWorkDirs(current: current),
-                ])
+                ]
+                if let lastWorkDir = store.lastRecordedWorkDir() {
+                    payload["last"] = lastWorkDir
+                }
+                return json(200, payload)
 
             case ("GET", "/api/session"):
                 return json(200, store.sessionData(
@@ -286,12 +290,17 @@ final class AgentPilotServer: @unchecked Sendable {
         switch type {
         case "start_cli":
             store.archiveCurrentSession(status: "completed")
+            let shouldRecordWorkDirSwitch = hasExplicitWorkDir(msg)
             cliManager.start(msg)
-            store.recordWorkDir(currentWorkDir())
+            if shouldRecordWorkDirSwitch {
+                store.recordWorkDir(currentWorkDir())
+            } else {
+                store.includeWorkDir(currentWorkDir())
+            }
             _ = store.createSession(config: cliManager.getConfig())
             broadcast(["type": "session_reset", "sessionId": store.currentSessionId(), "config": cliManager.getConfig().json(), "time": shortLocalTime()])
             broadcast(["type": "history_changed", "time": shortLocalTime()])
-            broadcast(["type": "workdirs_changed", "current": currentWorkDir(), "time": shortLocalTime()])
+            broadcast(workDirsChangedPayload())
 
         case "send_message":
             let content = msg["content"] as? String ?? ""
@@ -482,7 +491,7 @@ final class AgentPilotServer: @unchecked Sendable {
             "time": shortLocalTime(),
         ])
         broadcast(["type": "history_changed", "time": shortLocalTime()])
-        broadcast(["type": "workdirs_changed", "current": currentWorkDir(), "time": shortLocalTime()])
+        broadcast(workDirsChangedPayload())
 
         let followUp = (msg["content"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !followUp.isEmpty {
@@ -585,6 +594,23 @@ final class AgentPilotServer: @unchecked Sendable {
 
     private func currentWorkDir() -> String {
         cliManager.getConfig().workDir
+    }
+
+    private func hasExplicitWorkDir(_ msg: [String: Any]) -> Bool {
+        guard let value = msg["workDir"] as? String else { return false }
+        return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func workDirsChangedPayload() -> [String: Any] {
+        var payload: [String: Any] = [
+            "type": "workdirs_changed",
+            "current": currentWorkDir(),
+            "time": shortLocalTime(),
+        ]
+        if let lastWorkDir = store.lastRecordedWorkDir() {
+            payload["last"] = lastWorkDir
+        }
+        return payload
     }
 
     private func corsHeaders() -> [String: String] {

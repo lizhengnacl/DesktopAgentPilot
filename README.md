@@ -16,6 +16,10 @@ swift run DesktopAgentPilot
 PORT=3999 swift run DesktopAgentPilot
 ```
 
+桌面应用启动失败时，也可点击「关闭占用端口」来终止正在监听当前端口的进程，并自动重试启动。
+
+启动后的默认工作目录为 `~`；通过会话配置切换过的工作目录会记录到本机偏好设置，重启后仍可从 `/api/workdirs` 获取。
+
 健康检查：
 
 ```bash
@@ -28,13 +32,15 @@ curl http://<本机IP>:3101/
 AgentPilot Server
 ```
 
-## 构建
+## 构建与安装
+
+本地开发构建：
 
 ```bash
 swift build
 ```
 
-## 打包为 .app
+正式包构建会使用 release 配置，并生成 macOS `.app`：
 
 ```bash
 ./Scripts/package-app.sh
@@ -44,6 +50,18 @@ swift build
 
 ```text
 .build/app/DesktopAgentPilot.app
+```
+
+安装到本机应用目录：
+
+```bash
+ditto .build/app/DesktopAgentPilot.app /Applications/DesktopAgentPilot.app
+```
+
+安装完成后，可从 Finder 的「应用程序」中启动 `DesktopAgentPilot`，或使用：
+
+```bash
+open /Applications/DesktopAgentPilot.app
 ```
 
 ## 已实现接口
