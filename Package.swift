@@ -11,6 +11,11 @@ let package = Package(
         .executable(name: "DesktopAgentPilot", targets: ["DesktopAgentPilot"])
     ],
     targets: [
-        .executableTarget(name: "DesktopAgentPilot")
+        .executableTarget(
+            name: "DesktopAgentPilot",
+            resources: [
+                .process("Resources")
+            ]
+        )
     ]
 )
