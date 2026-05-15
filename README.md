@@ -19,7 +19,7 @@ PORT=3999 swift run DesktopAgentPilot
 健康检查：
 
 ```bash
-curl http://localhost:3101/
+curl http://<本机IP>:3101/
 ```
 
 固定返回：

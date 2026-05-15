@@ -685,7 +685,7 @@ final class HTTPConnection: @unchecked Sendable {
     }
 
     private func makeRequest(method: String, target: String, headers: [String: String], body: Data) -> HTTPRequest {
-        let components = URLComponents(string: "http://localhost\(target)")
+        let components = URLComponents(string: "http://\(LocalNetworkAddress.currentIPv4())\(target)")
         var query: [String: String] = [:]
         for item in components?.queryItems ?? [] {
             query[item.name] = item.value ?? ""
