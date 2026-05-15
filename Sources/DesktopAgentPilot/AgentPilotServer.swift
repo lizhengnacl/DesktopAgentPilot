@@ -193,6 +193,7 @@ final class AgentPilotServer: @unchecked Sendable {
 
             case ("GET", "/api/workdirs"):
                 let current = currentWorkDir()
+                store.recordWorkDir(current)
                 var payload: [String: Any] = [
                     "current": current,
                     "workdirs": store.recentWorkDirs(current: current),
@@ -290,13 +291,8 @@ final class AgentPilotServer: @unchecked Sendable {
         switch type {
         case "start_cli":
             store.archiveCurrentSession(status: "completed")
-            let shouldRecordWorkDirSwitch = hasExplicitWorkDir(msg)
             cliManager.start(msg)
-            if shouldRecordWorkDirSwitch {
-                store.recordWorkDir(currentWorkDir())
-            } else {
-                store.includeWorkDir(currentWorkDir())
-            }
+            store.recordWorkDir(currentWorkDir())
             _ = store.createSession(config: cliManager.getConfig())
             broadcast(["type": "session_reset", "sessionId": store.currentSessionId(), "config": cliManager.getConfig().json(), "time": shortLocalTime()])
             broadcast(["type": "history_changed", "time": shortLocalTime()])
@@ -317,7 +313,15 @@ final class AgentPilotServer: @unchecked Sendable {
             cliManager.interrupt()
 
         case "restart_cli":
-            store.archiveCurrentSession(status: cliManager.status == "running" ? "running" : "completed")
+            let taskStatus: String
+            if cliManager.status == "running" || cliManager.status == "confirm" {
+                taskStatus = "running"
+            } else if cliManager.status == "disconnected" {
+                taskStatus = "failed"
+            } else {
+                taskStatus = "completed"
+            }
+            store.archiveCurrentSession(status: taskStatus)
             _ = store.createSession(config: cliManager.getConfig())
             broadcast(["type": "session_reset", "sessionId": store.currentSessionId(), "config": cliManager.getConfig().json(), "time": shortLocalTime()])
             broadcast(["type": "history_changed", "time": shortLocalTime()])
@@ -549,22 +553,46 @@ final class AgentPilotServer: @unchecked Sendable {
     }
 
     private func buildEditPrompt(prefix: [SessionMessage], editedContent: String) -> String {
-        let entries = prefix.compactMap { message -> String? in
+        var entries: [(label: String, content: String)] = []
+        func pushEntry(_ label: String, _ content: String) {
+            if let last = entries.last, last.label == label, label == "助手" {
+                entries[entries.count - 1].content += content
+                return
+            }
+            entries.append((label, content))
+        }
+
+        for message in prefix {
             let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !content.isEmpty else { return nil }
-            if message.type == "user_message" || message.type == "user" { return "用户: \(content)" }
-            if message.type == "ai_message" || message.type == "ai" { return "助手: \(content)" }
-            if message.type == "tool_call" || message.type == "tool" { return "工具调用: \(content)" }
-            return nil
-        }.joined(separator: "\n\n")
+            guard !content.isEmpty else { continue }
+            if message.type == "user_message" || message.type == "user" {
+                pushEntry("用户", content)
+            } else if message.type == "ai_message" || message.type == "ai" {
+                pushEntry("助手", content)
+            } else if message.type == "tool_call" || message.type == "tool" {
+                var parts = [content]
+                if let toolDetails = message.toolDetails, !toolDetails.isEmpty {
+                    parts.append("输入: \(toolDetails)")
+                }
+                if let toolResult = message.toolResult, !toolResult.isEmpty {
+                    parts.append("输出: \(toolResult)")
+                }
+                pushEntry("工具调用", parts.joined(separator: "\n"))
+            } else if message.type == "ask_question" || message.type == "ask_question_result" {
+                pushEntry("澄清问题", content)
+            } else if message.type == "confirm_request" || message.type == "confirm_result" {
+                pushEntry("确认记录", content)
+            }
+        }
 
         guard !entries.isEmpty else { return editedContent }
+        let history = entries.map { "\($0.label): \($0.content)" }.joined(separator: "\n\n")
         return [
             "你正在一个新会话中接续一段用户已编辑的对话。",
             "下面是编辑点之前保留的对话记录，仅作为上下文；不要复述这段记录，直接回应最后的用户消息。",
             "",
             "<conversation_history>",
-            entries,
+            history,
             "</conversation_history>",
             "",
             "<edited_user_message>",
@@ -594,11 +622,6 @@ final class AgentPilotServer: @unchecked Sendable {
 
     private func currentWorkDir() -> String {
         cliManager.getConfig().workDir
-    }
-
-    private func hasExplicitWorkDir(_ msg: [String: Any]) -> Bool {
-        guard let value = msg["workDir"] as? String else { return false }
-        return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func workDirsChangedPayload() -> [String: Any] {

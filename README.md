@@ -86,4 +86,4 @@ open /Applications/DesktopAgentPilot.app
 - `POST /api/workdir/commit`
 - WebSocket 连接事件、会话控制、历史、目录、工作区文件/Git 旧 RPC。
 
-CLI 会话按 `print` 模式桥接 Codex/Claude；工作区文件和 Git 操作会限制在当前 `workDir` 内。
+CLI 会话可按 `print` 或 `interactive` 模式桥接 Codex/Claude；工作区文件和 Git 操作会限制在当前 `workDir` 内。

@@ -706,11 +706,23 @@ final class AgentStore: @unchecked Sendable {
 
     private static func historyTitle(from messages: [SessionMessage]) -> String {
         let content = messages.first { $0.type == "user_message" || $0.type == "user" }?.content ?? ""
-        let normalized = content
+        let withoutCodeBlocks = content.replacingOccurrences(of: #"```[\s\S]*?```"#, with: " ", options: .regularExpression)
+        let withoutInlineCode = withoutCodeBlocks.replacingOccurrences(of: #"`([^`]+)`"#, with: "$1", options: .regularExpression)
+        let normalized = withoutInlineCode
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("<") }
+            .filter {
+                guard !$0.isEmpty else { return false }
+                if $0.range(of: #"^#+\s*AGENTS\.md"#, options: [.regularExpression, .caseInsensitive]) != nil { return false }
+                if $0.range(of: #"^</?[A-Z_]+>"#, options: .regularExpression) != nil { return false }
+                if $0.range(of: #"^[-*]\s*$"#, options: .regularExpression) != nil { return false }
+                return true
+            }
             .joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"^#+\s*"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"^[-*]\s+"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return "会话记录" }
         if normalized.count <= 48 { return normalized }
         let index = normalized.index(normalized.startIndex, offsetBy: 48)
@@ -719,7 +731,9 @@ final class AgentStore: @unchecked Sendable {
 
     private static func formatDuration(seconds: Int64) -> String {
         if seconds < 60 { return "\(seconds)s" }
-        if seconds < 3600 { return "\(seconds / 60)m" }
+        if seconds < 3600 {
+            return "\(seconds / 60)m \(String(format: "%02d", seconds % 60))s"
+        }
         return "\(seconds / 3600)h"
     }
 
